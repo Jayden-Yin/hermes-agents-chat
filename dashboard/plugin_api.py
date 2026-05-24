@@ -84,6 +84,66 @@ _plugin_service: RoomService | None = None
 router = APIRouter(tags=["hermes-chat"])
 
 
+# ─── Config Cloning Helpers ───────────────────────────────────────────────────
+
+def _find_template_config(profiles_root: Path) -> dict | None:
+    """Find the best template config.yaml to clone for new agents.
+
+    Priority: _template > ma_zhuanzhu > largest config among non-chat profiles.
+    """
+    candidates = []
+    for d in sorted(profiles_root.iterdir()):
+        if not d.is_dir():
+            continue
+        cfg_path = d / "config.yaml"
+        if not cfg_path.exists():
+            continue
+        # Skip profiles that were created by Dashboard (tiny, only hermes_chat)
+        size = cfg_path.stat().st_size
+        if size < 2000:
+            continue
+        candidates.append((d.name, cfg_path, size))
+
+    if not candidates:
+        return None
+
+    # Prefer _template if it exists
+    for name, path, size in candidates:
+        if name == "_template":
+            with open(path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+
+    # Prefer ma_zhuanzhu (most complete dev profile)
+    for name, path, size in candidates:
+        if name == "ma_zhuanzhu":
+            with open(path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+
+    # Fall back to the largest config
+    candidates.sort(key=lambda x: -x[2])
+    with open(candidates[0][1], "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _deep_clone_config(config: dict) -> dict:
+    """Deep-clone a config dict to avoid mutating the template."""
+    import copy
+    return copy.deepcopy(config)
+
+
+def _strip_secrets(config: dict) -> None:
+    """Remove sensitive fields from a cloned config so new agents start clean."""
+    # Strip api_key from model config
+    if "model" in config and isinstance(config["model"], dict):
+        config["model"].pop("api_key", None)
+    # Strip api_key from auxiliary providers
+    for section in ("auxiliary",):
+        if section in config and isinstance(config[section], dict):
+            for key in config[section]:
+                if isinstance(config[section][key], dict):
+                    config[section][key].pop("api_key", None)
+
+
 # ─── Lifecycle Hooks ─────────────────────────────────────────────────────────
 
 def init_plugin(db_path: str | None = None) -> None:
@@ -347,6 +407,8 @@ async def update_user(req: UserProfile):
 @router.get("/contacts", response_model=list[AgentProfile])
 async def list_contacts():
     """List all agents as contacts. (README §2 私聊)"""
+    # Reload to pick up agents created outside the Dashboard
+    registry.reload()
     return registry.list()
 
 
@@ -354,6 +416,8 @@ async def list_contacts():
 
 @router.get("/agents", response_model=list[AgentProfile])
 async def list_agents():
+    # Reload to pick up agents created outside the Dashboard (CLI, manual config, etc.)
+    registry.reload()
     return registry.list()
 
 
@@ -361,7 +425,7 @@ async def list_agents():
 async def create_agent(req: AgentCreate):
     """Create a new agent profile, auto-join the default room, and broadcast."""
     # 1. Validate — name must be a valid identifier (lowercase, underscores only)
-    raw_name = req.name.strip()
+    raw_name = req.name.strip().lower()  # Hermes profiles are always lowercase
     if not raw_name:
         raise HTTPException(status_code=400, detail="Agent name is required")
     if not raw_name.replace("_", "").isalnum():
@@ -370,17 +434,35 @@ async def create_agent(req: AgentCreate):
     if registry.get(raw_name):
         raise HTTPException(status_code=409, detail=f"Agent '{raw_name}' already exists")
 
-    # 2. Create profile directory + config.yaml
+    # 2. Create profile directory — clone config from template profile
     profiles_dir = Path.home() / "AppData" / "Local" / "hermes" / "profiles" / raw_name
     profiles_dir.mkdir(parents=True, exist_ok=True)
-    config = {
-        "hermes_chat": {
-            "system_prompt": req.system_prompt,
-            "role": req.role or raw_name,
-        }
+
+    # Clone full config from the most complete existing profile as template,
+    # stripping secrets (api_key) and overlaying the new agent's hermes_chat.
+    _PROFILES_ROOT = Path.home() / "AppData" / "Local" / "hermes" / "profiles"
+    template_config = _find_template_config(_PROFILES_ROOT)
+
+    if template_config is not None:
+        # Deep-clone and sanitize
+        config = _deep_clone_config(template_config)
+        _strip_secrets(config)
+    else:
+        config = {}
+
+    # Overlay hermes_chat
+    config["hermes_chat"] = {
+        "system_prompt": req.system_prompt,
+        "role": req.role or raw_name,
     }
+
     with open(profiles_dir / "config.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, allow_unicode=True, default_flow_style=False)
+
+    # 2.5 — Write SOUL.md (CLI reads this for the agent's system prompt)
+    soul_path = profiles_dir / "SOUL.md"
+    with open(soul_path, "w", encoding="utf-8") as f:
+        f.write(req.system_prompt.strip() + "\n")
 
     # 3. Reload registry to pick up the new agent
     registry.reload()
@@ -442,6 +524,12 @@ async def update_agent(name: str, req: AgentUpdate):
 
     with open(config_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, allow_unicode=True, default_flow_style=False)
+
+    # Also sync to SOUL.md (CLI reads this for the agent's system prompt)
+    if req.system_prompt is not None:
+        soul_path = profiles_dir / "SOUL.md"
+        with open(soul_path, "w", encoding="utf-8") as f:
+            f.write(req.system_prompt.strip() + "\n")
 
     # Reload registry to pick up changes
     registry.reload()

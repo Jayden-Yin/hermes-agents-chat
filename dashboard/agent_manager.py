@@ -58,8 +58,13 @@ _FALLBACK_SOULS = {
 
 
 def _load_agent_profile(name: str) -> AgentProfile:
-    """Load agent profile from its Hermes config.yaml."""
+    """Load agent profile from its Hermes config.yaml.
+    
+    Auto-initializes the hermes_chat section if missing — reads SOUL.md
+    and writes it to config.yaml so the Dashboard Chat picks it up.
+    """
     config_path = _HERMES_PROFILES_DIR / name / "config.yaml"
+    soul_path = _HERMES_PROFILES_DIR / name / "SOUL.md"
 
     system_prompt = _FALLBACK_SOULS.get(name, f"You are {name}, a Hermes agent.")
     role = _ROLE_FALLBACKS.get(name, name.replace("_", " ").title())
@@ -67,12 +72,27 @@ def _load_agent_profile(name: str) -> AgentProfile:
     if config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
-                cfg = yaml.safe_load(f)
+                cfg = yaml.safe_load(f) or {}
             hc = cfg.get("hermes_chat", {})
             if hc.get("system_prompt"):
                 system_prompt = hc["system_prompt"]
             if hc.get("role"):
                 role = hc["role"]
+
+            # Auto-init hermes_chat for profiles created outside the Dashboard
+            if not hc.get("system_prompt") and soul_path.exists():
+                soul_content = soul_path.read_text(encoding="utf-8").strip()
+                if soul_content and soul_content != system_prompt:
+                    system_prompt = soul_content
+                    # Write back to config.yaml so Dashboard can edit it later
+                    hc["system_prompt"] = soul_content
+                    if "role" not in hc:
+                        hc["role"] = role
+                    cfg["hermes_chat"] = hc
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        yaml.safe_dump(cfg, f, allow_unicode=True, default_flow_style=False)
+                    logger.info("Auto-initialized hermes_chat for %s from SOUL.md", name)
+
         except Exception as exc:
             logger.warning("Failed to read config for %s: %s", name, exc)
 

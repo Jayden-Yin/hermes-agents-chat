@@ -724,10 +724,10 @@ function NewAgentModal({ api, onClose, onCreated, t }) {
   const [error, setError] = useState('');
 
   const handleCreate = async () => {
-    const trimmed = name.trim();
+    const trimmed = name.trim().toLowerCase();  // Hermes profiles are lowercase-only
     if (!trimmed) { setError(t('newAgentNameRequired')); return; }
-    if (!trimmed.replace(/_/g, '').match(/^[a-zA-Z0-9]+$/)) {
-      setError('Agent 名称只能包含字母、数字和下划线'); return;
+    if (!trimmed.replace(/_/g, '').match(/^[a-z0-9]+$/)) {
+      setError('Agent 名称只能包含小写字母、数字和下划线'); return;
     }
     if (!soul.trim()) { setError(t('newAgentSoulRequired')); return; }
     setCreating(true);
@@ -756,11 +756,15 @@ function NewAgentModal({ api, onClose, onCreated, t }) {
         <input
           type="text"
           value={name}
-          onChange={(e) => setName(e.target.value)}
+          onChange={(e) => setName(e.target.value.toLowerCase())}
           maxLength={64}
           placeholder={t('agentNamePlaceholder')}
           onKeyDown={(e) => e.key === 'Enter' && handleCreate()}
+          style={{ textTransform: 'lowercase' }}
         />
+        <div style={{ fontSize: 10, color: 'var(--hc-text-dim)', marginTop: 2 }}>
+          名称自动转为小写（与 Hermes CLI Profile 命名规范一致）
+        </div>
 
         <label>{t('agentRoleLabel')}</label>
         <input
